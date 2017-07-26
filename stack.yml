@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CiCdDemoVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+  CiCdDemoInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: CiCdDemoVpc
+  CiCdDemoAttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn:
+    - CiCdDemoVpc
+    - CiCdDemoInternetGateway
+    Properties:
+      VpcId:
+        Ref: CiCdDemoVpc
+      InternetGatewayId:
+        Ref: CiCdDemoInternetGateway
+  CiCdDemoBuildServerSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn:
+    - CiCdDemoVpc
+    - CiCdDemoAttachGateway
+    Properties:
+      VpcId:
+        Ref: CiCdDemoVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-east-1b
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: Build Server Subnet
+  CiCdDemoBuildServerRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn:
+    - CiCdDemoVpc
+    - CiCdDemoAttachGateway
+    Properties:
+      VpcId:
+        Ref: CiCdDemoVpc
+      Tags:
+      - Key: Name
+        Value: Build Server Route Table
+  CiCdDemoBuildServerRoute:
+    Type: AWS::EC2::Route
+    DependsOn: CiCdDemoBuildServerRouteTable
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId:
+        Ref: CiCdDemoBuildServerRouteTable
+      GatewayId:
+        Ref: CiCdDemoInternetGateway
+  CiCdDemoBuildServerRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+    - CiCdDemoBuildServerRouteTable
+    - CiCdDemoBuildServerSubnet
+    Properties:
+      RouteTableId:
+        Ref: CiCdDemoBuildServerRouteTable
+      SubnetId:
+        Ref: CiCdDemoBuildServerSubnet
+  CiCdDemoBuildServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+    - CiCdDemoVpc
+    - CiCdDemoAttachGateway
+    Properties:
+      GroupDescription: CI/CD Demo Jenkins Security Group
+      VpcId:
+        Ref: CiCdDemoVpc
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '8080'
+        ToPort: '8080'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: "-1"
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: Build Server Security Group
+  CiCdDemoBuildServerInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+    - CiCdDemoVpc
+    - CiCdDemoAttachGateway
+    - CiCdDemoBuildServerSubnet
+    - CiCdDemoBuildServerSecurityGroup
+    Properties:
+      KeyName: CiCdDemoKey
+      InstanceType: t2.micro
+      ImageId: ami-6869aa05
+      IamInstanceProfile:
+        Ref: CiCdDemoBuildServerInstanceProfile
+      Tags:
+      - Key: Name
+        Value: Jenkins Build Server
+      NetworkInterfaces:
+      - DeleteOnTermination: true
+        Description: Primary Network Interface
+        DeviceIndex: 0
+        SubnetId:
+          Ref: CiCdDemoBuildServerSubnet
+        GroupSet:
+        - Ref: CiCdDemoBuildServerSecurityGroup
+        AssociatePublicIpAddress: true
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource CiCdDemoBuildServerInstance --region us-east-1
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            "/root/install_deps.sh":
+              content:
+                !Sub |
+                  #!/bin/bash
+                  yum update -y
+                  wget http://javadl.oracle.com/webapps/download/AutoDL?BundleId=224918_336fa29ff2bb4ef291e347e091f7f4a7 -O java-8.rpm
+                  yum localinstall java-8.rpm -y
+                  wget -O /etc/yum.repos.d/jenkins.repo http://pkg.jenkins-ci.org/redhat-stable/jenkins.repo
+                  rpm --import http://pkg.jenkins-ci.org/redhat-stable/jenkins-ci.org.key
+                  yum install jenkins -y
+                  yum install git -y
+                  yum install java-1.8.0-openjdk* -y
+                  yum install docker -y
+                  usermod -a -G docker jenkins
+              mode: '000744'
+              owner: root
+              group: root
+          commands:
+            1_install_deps:
+              command: "/root/install_deps.sh"
+            2_start_jenkins:
+              command: service jenkins start
+            3_start_docker:
+              command: service docker start
+  CiCdDemoECRRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerServiceFullAccess
+  CiCdDemoBuildServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: CiCdDemoECRRole
+  CiCdDemoECSRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ci-cd-demo
+      RepositoryPolicyText:
+        Version: '2008-10-17'
+        Statement:
+        - Sid: new statement
+          Effect: Allow
+          Principal:
+            AWS: !GetAtt [CiCdDemoECRRole, Arn]
+          Action:
+          - ecr:GetDownloadUrlForLayer
+          - ecr:BatchGetImage
+          - ecr:BatchCheckLayerAvailability
+          - ecr:PutImage
+          - ecr:InitiateLayerUpload
+          - ecr:UploadLayerPart
+          - ecr:CompleteLayerUpload
+Outputs:
+  CiCdDemoBuildServerIp:
+    Value: !GetAtt [CiCdDemoBuildServerInstance, PublicIp]
+  CiCdDemoBuildServerInstanceId:
+    Value:
+      Ref: CiCdDemoBuildServerInstance
+
